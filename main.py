@@ -18,6 +18,8 @@ TELEX_AI_URL = os.getenv('TELEX_AI_URL')
 TELEX_AI_MODEL = os.getenv('TELEX_AI_MODEL')
 TELEX_ORG_ID = os.getenv('TELEX_ORG_ID')
 
+PORT = int(os.getenv("PORT", 4000))
+
 app = FastAPI()
 
 RAW_AGENT_CARD_DATA = {
@@ -352,4 +354,4 @@ async def handle_request(request: Request, background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=4000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=PORT, reload=True)
