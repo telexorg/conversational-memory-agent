@@ -123,7 +123,7 @@ async def analyze_intent_with_ai(user_message: str):
     """
 
     try:
-      async with httpx.AsyncClient() as client:
+      async with httpx.AsyncClient(timeout=5.0) as client:
         request_headers = {
           "X-AGENT-API-KEY": TELEX_API_KEY,
           "X-MODEL": TELEX_AI_MODEL
