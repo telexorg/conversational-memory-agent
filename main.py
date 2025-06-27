@@ -93,33 +93,58 @@ def agent_card(request: Request):
 
     return response_agent_card
 
-async def analyze_intent_with_ai(user_message: str):
+async def analyze_intent_with_ai(chat_history):
+
+    formatted_chat_history = "\n".join([f"{msg['role'].title()}: {msg['content']}" for msg in chat_history])
+      
     """
     Uses AI to analyze the user's message to determine intent.
     The AI will classify the intent and extract relevant data.
     """
     
     prompt = f"""
-    Analyze the following user message to determine the user's intent.
-    The intent can be one of three types:
-    1. 'remember': The user is stating a fact to be remembered.
-    2. 'recall': The user is asking a question about something they previously stated.
-    3. 'chat': The user is making a general conversational statement.
+    Analyze the last user message in the context of the full conversation history provided below to determine the user's intent.
 
-    Your response MUST be a JSON object with the following structure:
+    The intent can be one of three types:
+    1. 'remember': The user is stating a fact to be remembered (e.g., "my dog's name is Sparky").
+    2. 'recall': The user is asking a question about something they previously stated (e.g., "what is my dog's name?").
+    3. 'chat': The user is making a general conversational statement that requires a natural reply.
+
+    Your response MUST be a single, clean JSON object with the following structure:
     - For 'remember' intent: {{"intent": "remember", "data": {{"key": "<the fact category>", "value": "<the fact value>"}}}}
     - For 'recall' intent: {{"intent": "recall", "data": {{"key": "<the fact category to recall>"}}}}
-    - For 'chat' intent: {{"intent": "chat", "data": {{"key": "reply", "value": "<a natural reply to the input message>"}}}}
+    - For 'chat' intent: {{"intent": "chat", "data": {{"key": "reply", "value": "<a natural, context-aware reply to the user>"}}}}
 
+    ---
     Examples:
-    - User message: "my name is Mark" -> {{"intent": "remember", "data": {{"key": "name", "value": "Mark"}}}}
-    - User message: "my favorite color is blue" -> {{"intent": "remember", "data": {{"key": "favorite color", "value": "blue"}}}}
-    - User message: "what is my name?" -> {{"intent": "recall", "data": {{"key": "name"}}}}
-    - User message: "what's my favourite colour?" -> {{"intent": "recall", "data": {{"key": "favorite color"}}}}
-    - User message: "hello there" -> {{"intent": "chat", "data": {{"key": "reply", "value": "Hello to you too"}}}}
 
-    Now, analyze this message:
-    User message: "{user_message}"
+    Example 1: Remembering a fact
+    - Conversation History:
+    User: my name is Mark
+    - JSON Output:
+    {{"intent": "remember", "data": {{"key": "name", "value": "Mark"}}}}
+
+    Example 2: Recalling a fact
+    - Conversation History:
+    User: My favorite color is blue
+    Assistant: Okay, I'll remember that your favorite color is blue.
+    User: what's my favourite colour?
+    - JSON Output:
+    {{"intent": "recall", "data": {{"key": "favorite color"}}}}
+
+    Example 3: Contextual Chat
+    - Conversation History:
+    User: My favorite color is blue.
+    Assistant: Okay, I'll remember that your favorite color is blue.
+    User: That's great, thanks!
+    - JSON Output:
+    {{"intent": "chat", "data": {{"key": "reply", "value": "You're welcome! Is there anything else I can do for you?"}}}}
+    ---
+
+    Now, analyze the following conversation and produce the JSON output for the last user message.
+
+    Conversation History:
+    {formatted_chat_history}
     """
 
     try:
@@ -145,7 +170,8 @@ async def analyze_intent_with_ai(user_message: str):
         response = await client.post(
           TELEX_AI_URL, 
           headers=request_headers,
-          json=request_body
+          json=request_body,
+          timeout=15.0
         )
 
         pprint(response.json())
@@ -204,7 +230,6 @@ async def res_based_on_intent(payload, user_id):
         headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
         data = { 
           "filter": {
-            "organisation_id": TELEX_ORG_ID,
             "type": "user_information", 
             "user_id": user_id,
             "key": key
@@ -242,8 +267,43 @@ async def res_based_on_intent(payload, user_id):
   return response_message
 
 
-async def handle_task(message:str, request_id, context_id:str, task_id: str, webhook_url: str):
-  print("telex api url:", TELEX_API_URL)
+async def retrieve_chat_history(user_message, user_id):
+   #retrieve chat history from the database
+    chat_history = None
+    chat_history_id = None
+    async with httpx.AsyncClient() as client:
+      headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
+      data = { 
+        "filter": {
+          "type": "user_history", 
+          "user_id": user_id,
+        }
+      }
+      response = requests.get(
+        url=f"{TELEX_API_URL}/agent_db/collections/user_information/documents", 
+        headers=headers, 
+        json=data
+      )
+      print("Chat history response:")
+      pprint(response.json())
+
+      if response.status_code not in [200, 404]:
+        response.raise_for_status()
+
+      chat_history = response.json().get("data", [])
+      chat_history_id = chat_history[0].get("_id") if chat_history else None
+    
+    chat_history = chat_history[0].get("messages", []) if chat_history else []
+    chat_history.append({
+      "role": "user",
+      "content": user_message
+    })
+
+    return chat_history, chat_history_id
+
+
+async def handle_task(message:str, request_id, user_id:str, task_id: str, webhook_url: str):
+
   #attempt to create mongodb collection
   async with httpx.AsyncClient() as client:
     headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
@@ -258,10 +318,44 @@ async def handle_task(message:str, request_id, context_id:str, task_id: str, web
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="Failed to create or access the user information collection."
       )
+    
 
-  intent = await analyze_intent_with_ai(message)
+  chat_history, chat_history_id = await retrieve_chat_history(user_message=message, user_id=user_id)
 
-  response = await res_based_on_intent(intent, context_id)
+  intent = await analyze_intent_with_ai(chat_history)
+
+  response = await res_based_on_intent(intent, user_id)
+
+  chat_history.append({
+     "role": "assistant",
+     "content": response
+  })
+
+  #update or create if not exists
+  async with httpx.AsyncClient() as client:
+    headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
+    body = {
+      "document": {
+        "messages": chat_history
+      }
+    }
+    if chat_history_id:
+      db_history = await client.put(f"{TELEX_API_URL}/agent_db/collections/user_information/documents/{chat_history_id}", headers=headers, json=body)
+      pprint(db_history.json())
+
+    else:
+      body = {
+        "document": {
+          "type": "user_history",
+          "user_id": user_id,
+          "messages": chat_history,
+          "created_at": datetime.now().isoformat(),
+        }
+      }
+      db_history = await client.post(f"{TELEX_API_URL}/agent_db/collections/user_information/documents", headers=headers, json=body)
+      pprint(db_history.json())
+
+    db_history.raise_for_status()
 
   parts = schemas.TextPart(text=response)
 
