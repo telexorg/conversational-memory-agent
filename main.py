@@ -16,7 +16,6 @@ TELEX_API_KEY = os.getenv('TELEX_API_KEY')
 TELEX_API_URL = os.getenv('TELEX_API_URL')
 TELEX_AI_URL = os.getenv('TELEX_AI_URL')
 TELEX_AI_MODEL = os.getenv('TELEX_AI_MODEL')
-TELEX_ORG_ID = os.getenv('TELEX_ORG_ID')
 
 PORT = int(os.getenv("PORT", 4000))
 
@@ -93,7 +92,7 @@ def agent_card(request: Request):
 
     return response_agent_card
 
-async def analyze_intent_with_ai(chat_history):
+async def analyze_intent_with_ai(chat_history, api_key):
 
     formatted_chat_history = "\n".join([f"{msg['role'].title()}: {msg['content']}" for msg in chat_history])
       
@@ -150,7 +149,7 @@ async def analyze_intent_with_ai(chat_history):
     try:
       async with httpx.AsyncClient(timeout=5.0) as client:
         request_headers = {
-          "X-AGENT-API-KEY": TELEX_API_KEY,
+          "X-AGENT-API-KEY": api_key,
           "X-MODEL": TELEX_AI_MODEL
         }
         print(f"Request headers: {request_headers}")
@@ -188,7 +187,7 @@ async def analyze_intent_with_ai(chat_history):
         raise HTTPException(status_code=500, detail="Could not understand the AI model's response.")
 
 
-async def res_based_on_intent(payload, user_id):
+async def res_based_on_intent(payload, user_id, org_id, api_key):
   intent = payload["intent"]
   data = payload["data"]
    # Step 2: Act based on the analyzed intent
@@ -201,7 +200,7 @@ async def res_based_on_intent(payload, user_id):
 
     else:
       async with httpx.AsyncClient() as client:
-        headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
+        headers = {"X-AGENT-API-KEY": api_key}
         body = {
           "document": {
             "type": "user_information",
@@ -227,12 +226,13 @@ async def res_based_on_intent(payload, user_id):
       # Find the user's memory document
       user_memory = None
       async with httpx.AsyncClient() as client:
-        headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
+        headers = {"X-AGENT-API-KEY": api_key}
         data = { 
           "filter": {
             "type": "user_information", 
             "user_id": user_id,
-            "key": key
+            "key": key,
+            "organisation_id": org_id
           }
         }
         response = requests.get(
@@ -267,16 +267,18 @@ async def res_based_on_intent(payload, user_id):
   return response_message
 
 
-async def retrieve_chat_history(user_message, user_id):
+async def retrieve_chat_history(user_message, user_id, org_id, api_key):
    #retrieve chat history from the database
     chat_history = None
     chat_history_id = None
+
     async with httpx.AsyncClient() as client:
-      headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
+      headers = {"X-AGENT-API-KEY": api_key}
       data = { 
         "filter": {
           "type": "user_history", 
           "user_id": user_id,
+          "organisation_id": org_id
         }
       }
       response = requests.get(
@@ -302,11 +304,11 @@ async def retrieve_chat_history(user_message, user_id):
     return chat_history, chat_history_id
 
 
-async def handle_task(message:str, request_id, user_id:str, task_id: str, webhook_url: str):
+async def handle_task(message:str, request_id, user_id:str, task_id: str, webhook_url: str, org_id: str, api_key: str):
 
   #attempt to create mongodb collection
   async with httpx.AsyncClient() as client:
-    headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
+    headers = {"X-AGENT-API-KEY": api_key}
     body = {
       "collection": "user_information"
     }
@@ -320,11 +322,11 @@ async def handle_task(message:str, request_id, user_id:str, task_id: str, webhoo
       )
     
 
-  chat_history, chat_history_id = await retrieve_chat_history(user_message=message, user_id=user_id)
+  chat_history, chat_history_id = await retrieve_chat_history(user_message=message, user_id=user_id, org_id=org_id, api_key=api_key)
 
-  intent = await analyze_intent_with_ai(chat_history)
+  intent = await analyze_intent_with_ai(chat_history, api_key)
 
-  response = await res_based_on_intent(intent, user_id)
+  response = await res_based_on_intent(intent, user_id, org_id, api_key)
 
   chat_history.append({
      "role": "assistant",
@@ -333,7 +335,7 @@ async def handle_task(message:str, request_id, user_id:str, task_id: str, webhoo
 
   #update or create if not exists
   async with httpx.AsyncClient() as client:
-    headers = {"X-AGENT-API-KEY": TELEX_API_KEY}
+    headers = {"X-AGENT-API-KEY": api_key}
     body = {
       "document": {
         "messages": chat_history
@@ -381,7 +383,7 @@ async def handle_task(message:str, request_id, user_id:str, task_id: str, webhoo
 
 
   async with httpx.AsyncClient() as client:
-    headers = {"X-TELEX-API-KEY": TELEX_API_KEY}
+    headers = {"X-TELEX-API-KEY": api_key}
     is_sent = await client.post(webhook_url, headers=headers,  json=webhook_response.model_dump(exclude_none=True))
     pprint(is_sent.json())
 
@@ -405,7 +407,9 @@ async def handle_request(request: Request, background_tasks: BackgroundTasks):
 
   request_id = body.get("id")
   user_id = body["params"]["message"]["metadata"].get("telex_user_id", None)  
+  org_id = body["params"]["message"]["metadata"].get("org_id", None)  
   webhook_url = body["params"]["configuration"]["pushNotificationConfig"]["url"]
+  api_key = body["params"]["configuration"]["pushNotificationConfig"]["authentication"].get("credentials", TELEX_API_KEY)
 
   message = body["params"]["message"]["parts"][0].get("text", None)
 
@@ -423,7 +427,7 @@ async def handle_request(request: Request, background_tasks: BackgroundTasks):
     )
   )
   
-  background_tasks.add_task(handle_task, message, request_id, user_id, new_task.id, webhook_url)
+  background_tasks.add_task(handle_task, message, request_id, user_id, new_task.id, webhook_url, org_id, api_key)
 
   response = schemas.JSONRPCResponse(
       id=request_id,
